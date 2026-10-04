@@ -46,7 +46,7 @@ class RuleUpdateAndAlertTest {
         store = new EventStore();
         ruleSetProvider = new RuleSetProvider();
         scoringService = new RiskScoringService(store, ruleSetProvider);
-        alertService = new AlertService(store, ruleSetProvider, scoringService);
+        alertService = new AlertService(store, scoringService);
 
         EventIngestionService ingestion = new EventIngestionService(new EventValidator(), store);
         Instant base = Instant.parse("2026-09-01T00:00:00Z");
@@ -73,7 +73,7 @@ class RuleUpdateAndAlertTest {
         // 更新规则：大额阈值提到 100000，权重变化
         RiskRuleSet v2 = RiskRuleSet.validated(2, new BigDecimal("100000"),
                 5, 5, 10, 40, 10, 50);
-        ruleSetProvider.update(v2);
+        ruleSetProvider.publish(v2);
 
         RiskScoreResult after = scoringService.score(WHALE);
         log.info("after update: score={} version={} evidence={}",
@@ -111,8 +111,8 @@ class RuleUpdateAndAlertTest {
         }
         pool.submit(() -> {
             await(start);
-            ruleSetProvider.update(v2);
-            ruleSetProvider.update(v3);
+            ruleSetProvider.publish(v2);
+            ruleSetProvider.publish(v3);
         });
         start.countDown();
         pool.shutdown();

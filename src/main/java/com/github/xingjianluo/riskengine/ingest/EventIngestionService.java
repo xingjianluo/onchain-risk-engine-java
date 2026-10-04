@@ -39,10 +39,21 @@ public class EventIngestionService {
         }
 
         TransactionEvent normalized = normalize(event);
-        boolean inserted = eventStore.addIfAbsent(normalized);
-        if (!inserted) {
-            return reject(normalized.eventId(), RejectionReason.DUPLICATE_EVENT,
-                    "eventId already accepted: " + normalized.eventId());
+        EventStore.AddOutcome addOutcome = eventStore.addIfAbsent(normalized);
+        switch (addOutcome) {
+            case DUPLICATE_EVENT_ID -> {
+                return reject(normalized.eventId(), RejectionReason.DUPLICATE_EVENT,
+                        "eventId already accepted: " + normalized.eventId());
+            }
+            case DUPLICATE_TX_HASH -> {
+                String firstEventId = eventStore.findEventIdByTxHash(normalized.txHash());
+                return reject(normalized.eventId(), RejectionReason.DUPLICATE_TRANSACTION,
+                        "txHash already accounted by another event: txHash=" + normalized.txHash()
+                                + " firstEventId=" + firstEventId);
+            }
+            default -> {
+                // ACCEPTED，继续往下走
+            }
         }
 
         log.info("ingest accepted eventId={} txHash={} {} -> {} {} {}",

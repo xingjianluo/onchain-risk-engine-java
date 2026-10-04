@@ -36,15 +36,37 @@ public class RiskScoringService {
     }
 
     public RiskScoreResult score(String address) {
+        return score(address, null);
+    }
+
+    /**
+     * 按指定规则版本评分；version 为 null 时使用当前生效版本。
+     * 历史版本取自系统内部留存的版本历史，无需调用方自己保存旧规则。
+     *
+     * @throws RuleVersionNotFoundException 指定的版本从未发布过
+     */
+    public RiskScoreResult score(String address, Integer version) {
         if (!EventValidator.isValidAddress(address)) {
             throw new IllegalArgumentException("invalid address: " + address);
         }
-        RiskRuleSet rules = ruleSetProvider.current();
+        RiskRuleSet rules = resolveRules(version);
         List<TransactionEvent> snapshot = eventStore.snapshot();
         RiskScoreResult result = scoreOnSnapshot(address.toLowerCase(), snapshot, rules);
         log.info("score address={} rulesVersion={} score={} evidence={}",
                 result.address(), result.ruleSetVersion(), result.score(), result.evidence());
         return result;
+    }
+
+    /** 解析本次查询要使用的规则集：null -> 当前版本；否则必须已发布过。 */
+    public RiskRuleSet resolveRules(Integer version) {
+        if (version == null) {
+            return ruleSetProvider.current();
+        }
+        RiskRuleSet rules = ruleSetProvider.version(version);
+        if (rules == null) {
+            throw new RuleVersionNotFoundException(version);
+        }
+        return rules;
     }
 
     /** 对快照中所有出现过的钱包评分（告警查询使用），地址按字典序处理保证确定性。 */
@@ -69,6 +91,10 @@ public class RiskScoringService {
 
         TreeSet<String> outCounterparties = new TreeSet<>();
         TreeSet<String> inCounterparties = new TreeSet<>();
+        List<TransactionEvent> involved = new ArrayList<>();
+        List<TransactionEvent> largeAmountEvents = new ArrayList<>();
+        List<TransactionEvent> outgoingEvents = new ArrayList<>();
+        List<TransactionEvent> incomingEvents = new ArrayList<>();
 
         for (TransactionEvent e : snapshot) {
             boolean outgoing = e.fromAddress().equals(address);
@@ -76,14 +102,18 @@ public class RiskScoringService {
             if (!outgoing && !incoming) {
                 continue;
             }
+            involved.add(e);
             if (outgoing) {
                 outCounterparties.add(e.toAddress());
+                outgoingEvents.add(e);
             }
             if (incoming) {
                 inCounterparties.add(e.fromAddress());
+                incomingEvents.add(e);
             }
             if (e.amount().compareTo(rules.largeAmountThreshold()) >= 0) {
                 score += rules.largeAmountWeight();
+                largeAmountEvents.add(e);
                 evidence.add(String.format(
                         "LARGE_AMOUNT(+%d): event=%s tx=%s %s %s %s->%s >= threshold %s",
                         rules.largeAmountWeight(), e.eventId(), e.txHash(),
@@ -93,21 +123,61 @@ public class RiskScoringService {
             }
         }
 
+        List<RuleHit> ruleHits = new ArrayList<>();
+        if (!largeAmountEvents.isEmpty()) {
+            ruleHits.add(buildHit("LARGE_AMOUNT", address, largeAmountEvents));
+        }
+
         if (outCounterparties.size() >= rules.fanOutThreshold()) {
             score += rules.fanOutWeight();
             evidence.add(String.format("FAN_OUT(+%d): %d distinct out-counterparties >= %d %s",
                     rules.fanOutWeight(), outCounterparties.size(),
                     rules.fanOutThreshold(), outCounterparties));
+            ruleHits.add(buildHit("FAN_OUT", address, outgoingEvents));
         }
         if (inCounterparties.size() >= rules.fanInThreshold()) {
             score += rules.fanInWeight();
             evidence.add(String.format("FAN_IN(+%d): %d distinct in-counterparties >= %d %s",
                     rules.fanInWeight(), inCounterparties.size(),
                     rules.fanInThreshold(), inCounterparties));
+            ruleHits.add(buildHit("FAN_IN", address, incomingEvents));
         }
 
         int finalScore = Math.min(score, MAX_SCORE);
         evidence.add("TOTAL=" + finalScore + (score > MAX_SCORE ? " (capped from " + score + ")" : ""));
-        return new RiskScoreResult(address, finalScore, rules.version(), List.copyOf(evidence));
+        return new RiskScoreResult(address, finalScore, rules.version(),
+                List.copyOf(evidence), List.copyOf(ruleHits),
+                EventSetFingerprint.of(involved));
+    }
+
+    /**
+     * 由一组关联交易构造一条结构化命中记录。输入事件来自确定性排序的快照，
+     * 集合字段再统一排序，因此输出与事件到达顺序、重复投递次数无关。
+     */
+    private static RuleHit buildHit(String rule, String address, List<TransactionEvent> related) {
+        TreeSet<String> counterparties = new TreeSet<>();
+        TreeSet<String> eventIds = new TreeSet<>();
+        TreeSet<String> txHashes = new TreeSet<>();
+        java.math.BigDecimal totalAmount = java.math.BigDecimal.ZERO;
+        boolean anyOutgoing = false;
+        boolean anyIncoming = false;
+        for (TransactionEvent e : related) {
+            if (e.fromAddress().equals(address)) {
+                anyOutgoing = true;
+                counterparties.add(e.toAddress());
+            }
+            if (e.toAddress().equals(address)) {
+                anyIncoming = true;
+                counterparties.add(e.fromAddress());
+            }
+            eventIds.add(e.eventId());
+            txHashes.add(e.txHash());
+            totalAmount = totalAmount.add(e.amount());
+        }
+        String direction = anyOutgoing && anyIncoming ? RuleHit.DIRECTION_BOTH
+                : anyOutgoing ? RuleHit.DIRECTION_OUTGOING : RuleHit.DIRECTION_INCOMING;
+        return new RuleHit(rule, direction,
+                List.copyOf(counterparties), totalAmount.stripTrailingZeros(),
+                List.copyOf(eventIds), List.copyOf(txHashes));
     }
 }

@@ -76,6 +76,33 @@ class ApiSmokeTest {
         log.info("PUT /api/rules -> {}", updated.getBody());
         assertThat(updated.getBody()).containsEntry("version", 2);
 
+        // 同一版本号重复发布 -> 409，已发布内容不被覆盖
+        ResponseEntity<Map> duplicate = rest.exchange("/api/rules", HttpMethod.PUT,
+                new HttpEntity<>(newRules), Map.class);
+        log.info("PUT /api/rules duplicate -> {} {}", duplicate.getStatusCode(), duplicate.getBody());
+        assertThat(duplicate.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(duplicate.getBody()).containsEntry("error", "DUPLICATE_RULE_VERSION");
+
+        // 版本历史可查询，历史版本可复算
+        ResponseEntity<Object[]> versions = rest.getForEntity("/api/rules/versions", Object[].class);
+        log.info("GET /api/rules/versions -> {}", (Object[]) versions.getBody());
+        assertThat(versions.getBody()).containsExactly(1, 2);
+
+        ResponseEntity<Map> replayV1 = rest.getForEntity("/api/scores/" + WHALE + "?version=1", Map.class);
+        log.info("GET /api/scores?version=1 -> {}", replayV1.getBody());
+        assertThat(replayV1.getBody()).containsEntry("ruleSetVersion", 1)
+                .containsEntry("score", 100);
+
+        ResponseEntity<Map> unknownVersion = rest.getForEntity("/api/scores/" + WHALE + "?version=99", Map.class);
+        log.info("GET /api/scores?version=99 -> {} {}", unknownVersion.getStatusCode(), unknownVersion.getBody());
+        assertThat(unknownVersion.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+        // 兼容性：旧字段（score/ruleSetVersion/evidence）仍在，新增结构化字段为附加内容
+        ResponseEntity<Map> scoreNow = rest.getForEntity("/api/scores/" + WHALE, Map.class);
+        log.info("GET /api/scores -> {}", scoreNow.getBody());
+        assertThat(scoreNow.getBody()).containsKeys(
+                "address", "score", "ruleSetVersion", "evidence", "ruleHits", "eventSetFingerprint");
+
         ResponseEntity<Map> invalidScore = rest.getForEntity("/api/scores/not-an-address", Map.class);
         log.info("GET /api/scores/not-an-address -> {}", invalidScore.getBody());
         assertThat(invalidScore.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
