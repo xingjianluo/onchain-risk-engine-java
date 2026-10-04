@@ -39,10 +39,20 @@ public class EventIngestionService {
         }
 
         TransactionEvent normalized = normalize(event);
-        boolean inserted = eventStore.addIfAbsent(normalized);
-        if (!inserted) {
-            return reject(normalized.eventId(), RejectionReason.DUPLICATE_EVENT,
-                    "eventId already accepted: " + normalized.eventId());
+        EventStore.StoreResult storeResult = eventStore.addIfAbsent(normalized);
+        switch (storeResult) {
+            case DUPLICATE_EVENT_ID -> {
+                return reject(normalized.eventId(), RejectionReason.DUPLICATE_EVENT,
+                        "eventId already accepted: " + normalized.eventId());
+            }
+            case DUPLICATE_TX_HASH -> {
+                return reject(normalized.eventId(), RejectionReason.DUPLICATE_TRANSACTION,
+                        "txHash already accepted under another eventId: " + normalized.txHash()
+                                + " (rejected eventId=" + normalized.eventId() + ")");
+            }
+            default -> {
+                // INSERTED，继续往下走
+            }
         }
 
         log.info("ingest accepted eventId={} txHash={} {} -> {} {} {}",
@@ -60,7 +70,7 @@ public class EventIngestionService {
     private static TransactionEvent normalize(TransactionEvent e) {
         return new TransactionEvent(
                 e.eventId(),
-                e.txHash(),
+                e.txHash().trim().toLowerCase(),
                 e.fromAddress().toLowerCase(),
                 e.toAddress().toLowerCase(),
                 e.amount().stripTrailingZeros(),
