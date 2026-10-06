@@ -13,6 +13,10 @@ import org.springframework.stereotype.Service;
  *
  * <p>地址在校验后统一归一化为小写，保证同一地址大小写混写时
  * 仍然归入同一个钱包（资金流向统计与顺序无关）。</p>
+ *
+ * <p>交易哈希同样统一归一化为小写后再落库：同一笔链上交易无论上游用
+ * 大写、小写还是混合写法投递，留存记录、评分依据链、结构化判定依据与
+ * 事件集合指纹里出现的都是同一种（小写）写法，与到达顺序无关。</p>
  */
 @Service
 public class EventIngestionService {
@@ -71,7 +75,7 @@ public class EventIngestionService {
     private static TransactionEvent normalize(TransactionEvent e) {
         return new TransactionEvent(
                 e.eventId(),
-                e.txHash(),
+                e.txHash().toLowerCase(java.util.Locale.ROOT),
                 e.fromAddress().toLowerCase(),
                 e.toAddress().toLowerCase(),
                 e.amount().stripTrailingZeros(),

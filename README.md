@@ -42,8 +42,10 @@ LocalEventStreamSimulator  启动时本地模拟事件流（默认关闭）
   `eventIds` / `txHashes`（关联交易记录，升序）。
 - **事件集合指纹（新增）**：`RiskScoreResult.eventSetFingerprint` 是本次评分所依据
   事件集合（该地址参与的全部已接受事件）的 SHA-256。事件先按 `(timestamp, eventId)`
-  确定性排序再逐行序列化哈希，因此**同一批事件无论到达顺序、重复投递次数如何，
-  指纹与结构化依据完全一致；事件集合有任何增删改，指纹必然变化**。
+  确定性排序再逐行序列化哈希，且入库前交易哈希统一归一化为小写、同一笔交易的
+  多次投递收敛到同一条规范留存记录（见 3.1），因此**同一批事件无论到达顺序、
+  重复投递次数、哈希大小写写法如何，指纹与结构化依据完全一致；
+  事件集合有任何增删改，指纹必然变化**。
 - 告警列表按分数降序、地址升序排列，保证多次查询输出稳定。
 
 规则集是不可变 record，"更新规则"是整体替换引用（`PUT /api/rules`，参数须通过范围校验）。
@@ -81,6 +83,17 @@ curl -s "localhost:8080/api/alerts?version=1"             # 按 v1 复算告警
 - 两级检查与写入在同一把锁内原子完成，几十个线程同时灌入重复数据时，
   同一笔交易也只会被接受一次（`TransactionDedupTest` 覆盖 32 线程 × 640 份重复投递）。
 - 地址在入库前统一归一化为小写，因此大小写混写不影响去重与归集。
+- **交易哈希大小写口径**：txHash 在入库前同样统一归一化为小写。同一笔交易无论上游用
+  大写、小写还是混合写法投递，评分依据链、`RuleHit.txHashes` 与事件集合指纹里出现的
+  都是同一种（小写）写法，与"先到大写版还是先到小写版"无关。
+- **规范留存（canonical retention）**：同一笔交易被换投递编号重投时，拒绝响应不变
+  （`DUPLICATE_TRANSACTION`），但留存记录会收敛为**投递编号字典序最小**的那一条——
+  后到的投递若编号更小，会替换当前留存的记录。因此无论各版本按什么顺序到达、
+  以何种并发交错灌入，最终留存的记录只取决于投递集合本身，评分显示的交易哈希、
+  结构化判定依据与事件集合指纹在任意到达顺序下逐字段一致
+  （`TxHashCaseRedeliveryDeterminismTest` 覆盖 6 种到达顺序 + 36 线程并发灌入）。
+- 曾被接受过的投递编号会被记住：即使其记录后来因规范留存被替换，同一编号再次投递
+  仍报 `DUPLICATE_EVENT`（而非 `DUPLICATE_TRANSACTION`），两种拒因始终可区分。
 - 写入前先经 `EventValidator` 校验。被拒绝的事件不会进入统计，且返回**可区分**的拒绝原因
   （`RejectionReason`）：
 
@@ -150,6 +163,15 @@ curl -s "localhost:8080/api/alerts?version=1"             # 按 v1 复算告警
   既有拒绝原因（含 `DUPLICATE_EVENT`）的语义不变；
 - 不带 `version` 参数的评分/告警查询行为与之前一致（使用当前生效规则集）。
 
+**口径细化（对账一致性修复，不改变接口结构）：**
+
+- 同一笔交易换大小写/换投递编号重投时，**留存内容**从"先到先留"改为确定性的
+  规范留存：txHash 一律小写、多次投递收敛到投递编号字典序最小的一条。
+  因此同一批事件换个到达顺序，评分里的交易哈希写法、`ruleHits` 与
+  `eventSetFingerprint` 不再随之变化（修复前会先到大写就留大写、先到小写就留小写，
+  指纹跟着到达顺序漂移）。只消费旧字段的调用方不受影响；之前依赖"先到的写法会被
+  原样展示"的对账脚本，现在看到的永远是小写规范写法。
+
 **新增（纯追加，不影响旧字段消费方）：**
 
 - 评分结果追加 `ruleHits`（结构化判定依据）与 `eventSetFingerprint`（事件集合指纹）
@@ -181,6 +203,10 @@ mvn test
   断言接受数、重复拒绝数、存储大小，并对 5 种不同摄入顺序断言评分与依据链完全一致；
 - `TransactionDedupTest`：同一 txHash 换投递编号重复推送（含 32 线程 × 640 份并发灌入）
   只计价一次；`DUPLICATE_EVENT` 与 `DUPLICATE_TRANSACTION` 两种拒因可区分；
+- `TxHashCaseRedeliveryDeterminismTest`：同一笔交易换大小写写法、有的换投递编号、
+  有的不换，按 6 种到达顺序逐条灌入 + 36 线程并发灌入两种方式，断言只接受一条、
+  留存记录收敛到规范（小写哈希 + 字典序最小投递编号）、指纹与结构化依据逐字段一致、
+  两种拒因可区分；对照组验证哈希内容不同的交易仍各自计价；
 - `RuleUpdateAndAlertTest`：规则更新后旧版本结论按版本复现、告警查询与
   规则更新并发时版本自洽、非法规则被拒、告警排序稳定；
 - `RuleVersionHistoryTest`：每个发布版本留存、同版本号/回退发布被拒、
@@ -198,9 +224,14 @@ mvn test
 ```bash
 mvn test -Dtest=ConcurrentIngestionTest
 mvn test -Dtest=TransactionDedupTest
+mvn test -Dtest=TxHashCaseRedeliveryDeterminismTest
 mvn test -Dtest=RuleVersionHistoryTest
 mvn test -Dtest=ConcurrentPublishQueryTest
 ```
+
+其中 `TxHashCaseRedeliveryDeterminismTest` 的日志会逐条打印：每种到达顺序下
+接受/两种拒因的计数、最终留存的 eventId 与小写 txHash、单线程基线指纹、
+并发灌入后的指纹及"与单线程一致=true"的比对结果。
 
 ### 5.2 启动应用 + 本地模拟事件流
 
