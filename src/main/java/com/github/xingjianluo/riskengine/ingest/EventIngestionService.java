@@ -12,7 +12,10 @@ import org.springframework.stereotype.Service;
  * 事件摄入服务：先做字段校验，再做幂等落库。
  *
  * <p>地址在校验后统一归一化为小写，保证同一地址大小写混写时
- * 仍然归入同一个钱包（资金流向统计与顺序无关）。</p>
+ * 仍然归入同一个钱包（资金流向统计与顺序无关）。交易哈希同样统一
+ * 归一化为小写：同一笔链上交易无论上游用哪种大小写写法投递，
+ * 留存的哈希、评分依据、结构化依据与事件集合指纹都逐字节一致，
+ * 只由"是哪笔交易"决定，与首达投递的写法无关。</p>
  */
 @Service
 public class EventIngestionService {
@@ -71,7 +74,7 @@ public class EventIngestionService {
     private static TransactionEvent normalize(TransactionEvent e) {
         return new TransactionEvent(
                 e.eventId(),
-                e.txHash(),
+                EventStore.canonicalTxHash(e.txHash()),
                 e.fromAddress().toLowerCase(),
                 e.toAddress().toLowerCase(),
                 e.amount().stripTrailingZeros(),

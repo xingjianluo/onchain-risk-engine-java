@@ -32,6 +32,12 @@ LocalEventStreamSimulator  启动时本地模拟事件流（默认关闭）
 - 总分封顶 100；告警线默认 50（`alertScoreThreshold`，分数 ≥ 阈值即告警）。
 - 地址校验通过后统一归一化为小写，资产代码大写、金额去尾零，因此
   `0xAa...aa` 与 `0xaa...aa` 视为同一钱包。
+- **交易哈希大小写归一化（本次修复）**：txHash 校验通过后同样统一归一化为
+  **小写规范形式**（`EventStore.canonicalTxHash`，ROOT Locale）再入库。
+  同一笔链上交易无论上游用 `0XABCDEF1`、`0xabcdef1` 还是 `0xAbCdEf1`
+  投递，**系统中留存与对外展示的哈希永远是唯一的小写规范形式，与哪一版先到无关**，
+  评分依据 `evidence`、结构化依据 `ruleHits.txHashes`、事件集合指纹
+  `eventSetFingerprint` 中出现的哈希与大小写写法无关，只由"是哪笔交易"决定。
 - **可解释依据链**：`RiskScoreResult.evidence` 逐条记录命中规则、加减分、
   事件 ID、交易哈希、金额、方向与对手方集合，并记录使用的规则集版本，例如
   `LARGE_AMOUNT(+20): event=evt-1 tx=0xtx1 50000 ETH 0xaa..->0x00..01 >= threshold 10000`。
@@ -42,7 +48,8 @@ LocalEventStreamSimulator  启动时本地模拟事件流（默认关闭）
   `eventIds` / `txHashes`（关联交易记录，升序）。
 - **事件集合指纹（新增）**：`RiskScoreResult.eventSetFingerprint` 是本次评分所依据
   事件集合（该地址参与的全部已接受事件）的 SHA-256。事件先按 `(timestamp, eventId)`
-  确定性排序再逐行序列化哈希，因此**同一批事件无论到达顺序、重复投递次数如何，
+  确定性排序再逐行序列化哈希（序列化前 txHash/地址均为小写规范形式、资产大写、
+  金额去尾零），因此**同一批事件无论到达顺序、重复投递次数、哈希大小写写法如何，
   指纹与结构化依据完全一致；事件集合有任何增删改，指纹必然变化**。
 - 告警列表按分数降序、地址升序排列，保证多次查询输出稳定。
 
@@ -75,12 +82,25 @@ curl -s "localhost:8080/api/alerts?version=1"             # 按 v1 复算告警
 ### 3.1 摄入幂等（两级去重）
 
 - 业务上的"同一笔交易"只计价一次，判定口径为两级：
-  1. **eventId 相同** → 同一次投递的重复，拒绝原因 `DUPLICATE_EVENT`；
-  2. **txHash 相同（忽略大小写）但 eventId 不同** → 同一笔链上交易换了投递编号重新推送，
+  1. **eventId 相同** → 同一次投递的重复（哪怕这次换了哈希写法），拒绝原因 `DUPLICATE_EVENT`；
+  2. **txHash 相同（忽略大小写，`0X`/`0x` 前缀也不区分）但 eventId 不同** → 同一笔链上交易换了投递编号重新推送，
      拒绝原因 `DUPLICATE_TRANSACTION`，拒绝说明中带首次接受该交易的 eventId 便于定位。
+- **大小写与投递编号对留存内容的口径**：两级检查以 txHash 的**小写规范形式**为键；
+  一旦某笔交易被接受，入库记录中的 txHash 即被替换成小写规范形式（地址、金额、资产
+  也都已归一化）。被拒绝的重投——无论换大小写、换投递编号还是二者都换——**不会覆盖、
+  也不会污染**任何留存内容。因此：
+  - 大写版先到还是小写版先到，只影响"哪个 eventId 被接受"这一投递事实，
+    **不影响**留存哈希、人读依据、结构化依据与事件集合指纹；
+  - 同一批事件按任意顺序单线程灌入，与几十个线程并发灌入，得到的评分结果
+    （在被接受投递相同的前提下）逐字段一致；
+  - eventId（投递编号）本身仍是哪一次投递被接受的事实记录：换编号重投被拒后
+    留存的仍是首次接受那条的 eventId，不会改写。
 - 两级检查与写入在同一把锁内原子完成，几十个线程同时灌入重复数据时，
-  同一笔交易也只会被接受一次（`TransactionDedupTest` 覆盖 32 线程 × 640 份重复投递）。
+  同一笔交易也只会被接受一次（`TransactionDedupTest` 覆盖 32 线程 × 640 份重复投递，
+  `TxHashCaseDedupTest` 专门覆盖 32 线程 × 192/224 份不同大小写、不同编号的重投）。
 - 地址在入库前统一归一化为小写，因此大小写混写不影响去重与归集。
+- 哈希**确实不同**（不止大小写差异，如 `0xabcdef1` 与 `0xabcdef2`）仍是不同交易，
+  各自计价，不会被误判成一笔（`TxHashCaseDedupTest` 对照组覆盖）。
 - 写入前先经 `EventValidator` 校验。被拒绝的事件不会进入统计，且返回**可区分**的拒绝原因
   （`RejectionReason`）：
 
@@ -157,6 +177,11 @@ curl -s "localhost:8080/api/alerts?version=1"             # 按 v1 复算告警
 - 新增拒绝原因 `DUPLICATE_TRANSACTION`：**行为变化点**——同一 txHash 换 eventId
   重复推送，以前会被当作新交易计价，现在会被拒绝。上游若依赖"换投递编号即可重新计价"
   的旧行为，需要先为那笔交易构造新的 txHash（即业务上确实是另一笔交易）；
+- **交易哈希留存口径修复（本次）**：txHash 以前按首达投递的原样大小写留存，
+  导致大写版先到时 `evidence` / `ruleHits` / 指纹里全是大写、小写版先到又全是小写，
+  同一批事件换个到达顺序指纹就对不上。现在统一留存小写规范形式，
+  所有对外字段（含既有 `evidence` 文本中的 `tx=...`）都只出现小写哈希。
+  接口路径、请求体、响应结构与各字段含义均未改变，仅规范化了既有文本字段的大小写；
 - `PUT /api/rules` 新增发布约束：版本号必须大于当前版本且未发布过，
   重复发布返回 409（以前是同版本号静默覆盖）；
 - 新增只读端点 `/api/rules/versions`、`/api/rules/{version}` 及查询参数 `version`。
@@ -181,6 +206,14 @@ mvn test
   断言接受数、重复拒绝数、存储大小，并对 5 种不同摄入顺序断言评分与依据链完全一致；
 - `TransactionDedupTest`：同一 txHash 换投递编号重复推送（含 32 线程 × 640 份并发灌入）
   只计价一次；`DUPLICATE_EVENT` 与 `DUPLICATE_TRANSACTION` 两种拒因可区分；
+- `TxHashCaseDedupTest`（本次新增，稳定复现对账问题）：同一笔交易仅换哈希大小写
+  写法（`0XABCDEF1` / `0xabcdef1` / `0xAbCdEf1`），重投有的换投递编号、有的不换——
+  - 按大写先到 / 小写先到 / 混写先到三种顺序单线程灌入：断言只接受一条、
+    留存哈希与 `evidence` 中只剩小写规范形式、`ruleHits` 与 `eventSetFingerprint`
+    同基准逐字段一致、两种拒因都出现且可区分、拒绝说明指向首次接受的 eventId；
+  - 32 线程无预埋并发灌入：恰好接受一条，再用胜出投递编号单线程等价重放，
+    评分结果逐字段一致；预埋一条后再并发重灌：并发期 0 接受，结果同单线程基准；
+  - 对照组：哈希末位不同（非大小写差异）仍是两笔交易，各自计价；
 - `RuleUpdateAndAlertTest`：规则更新后旧版本结论按版本复现、告警查询与
   规则更新并发时版本自洽、非法规则被拒、告警排序稳定；
 - `RuleVersionHistoryTest`：每个发布版本留存、同版本号/回退发布被拒、
@@ -198,8 +231,43 @@ mvn test
 ```bash
 mvn test -Dtest=ConcurrentIngestionTest
 mvn test -Dtest=TransactionDedupTest
+mvn test -Dtest=TxHashCaseDedupTest
 mvn test -Dtest=RuleVersionHistoryTest
 mvn test -Dtest=ConcurrentPublishQueryTest
+```
+
+### 5.1.1 本地复现"哈希大小写导致对不上账"及验证修复
+
+单测（推荐，确定性、可重复）：
+
+```bash
+mvn test -Dtest=TxHashCaseDedupTest
+```
+
+日志中可见每种到达顺序下的业务含义与结果，例如：
+
+```
+顺序#1 (首达写法=0XABCDEF1) 首达轮 accepted=1/3; 不换编号重投拒因=[DUPLICATE_EVENT]; 换编号重投拒因=[DUPLICATE_TRANSACTION] (说明均指向 evt-1)
+顺序#1 评分: score=100 fingerprint=0b0d... 与基准逐字段一致=true
+并发(无预埋): total=192 accepted=1 duplicateEvent(同编号)=3 duplicateTransaction(换编号)=188 storeSize=6
+```
+
+也可以用 curl 手工复现：先以大写哈希投一笔，再以小写哈希换编号重投（被拒），
+随后评分，观察返回中的 `tx=...`、`ruleHits[].txHashes` 与 `eventSetFingerprint`
+始终是小写；换过来先投小写再投大写，三次结果（分数/证据/指纹）完全一致：
+
+```bash
+curl -s -XPOST localhost:8080/api/events -H 'Content-Type: application/json' -d '{
+  "eventId":"evt-1","txHash":"0XABCDEF1",
+  "fromAddress":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "toAddress":"0x0101010101010101010101010101010101010101",
+  "amount":50000,"asset":"ETH","timestamp":"2026-09-01T00:01:00Z"}'
+curl -s -XPOST localhost:8080/api/events -H 'Content-Type: application/json' -d '{
+  "eventId":"evt-2","txHash":"0xabcdef1",
+  "fromAddress":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "toAddress":"0x0101010101010101010101010101010101010101",
+  "amount":50000,"asset":"ETH","timestamp":"2026-09-01T00:01:00Z"}'   # DUPLICATE_TRANSACTION
+curl -s localhost:8080/api/scores/0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ```
 
 ### 5.2 启动应用 + 本地模拟事件流
